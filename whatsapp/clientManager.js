@@ -1,4 +1,4 @@
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, RemoteAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode");
 const fs = require("fs");
 const path = require("path");
@@ -14,6 +14,24 @@ async function getSession(userId) {
   const record = await WhatsappSession.findOne({ userId });
   return record?.sessionData || null;
 }
+
+const store = {
+  save: async ({ session, clientId }) => {
+    // The clientId is the userId you passed to RemoteAuth
+    await WhatsappSession.findOneAndUpdate(
+      { userId: clientId },
+      { sessionData: session },
+      { upsert: true }
+    );
+  },
+  fetch: async ({ clientId }) => {
+    const record = await WhatsappSession.findOne({ userId: clientId });
+    return record ? record.sessionData : null;
+  },
+  delete: async ({ clientId }) => {
+    await WhatsappSession.deleteOne({ userId: clientId });
+  }
+};
 
 async function saveSession(userId, session) {
   await WhatsappSession.findOneAndUpdate(
@@ -54,7 +72,7 @@ async function createClient(userId) {
   const clientPromise = new Promise(async (resolve, reject) => {
     try {
       const client = new Client({
-        authStrategy: new LocalAuth({ clientId: userId }),
+        authStrategy: new RemoteAuth({ clientId: userId }),
         puppeteer: {
         headless: true,
         args: [
@@ -76,38 +94,33 @@ async function createClient(userId) {
         console.log("📌 Scan QR to authenticate!");
         const qrCodeImage = await qrcode.toDataURL(qr);
         clientWrapper.qr = qrCodeImage;
-        clients[userId] = clientWrapper;
-        delete initialisingClients[userId];
-        resolve(clientWrapper);
+        resolve(clientWrapper); // Resolve with QR without storing client yet
       });
-
-      client.on("authenticated", async (session) => {
-    console.log("[DEBUG] Event: 'authenticated'. Attempting to save session to DB.");
-    try {
-        await saveSession(userId, session);
-        console.log("[DEBUG] Session saved to DB successfully!");
-    } catch (error) {
-        console.error("[DEBUG] CRITICAL ERROR: Failed to save session to DB.", error);
-    }
-    
-    if (clients[userId]) {
-        clients[userId].qr = null; 
-    }
-});
 
       client.on("ready", () => {
         console.log(`✅ WhatsApp client ready for user ${userId}`);
-        clientWrapper.qr = null;
-        clients[userId] = clientWrapper;
+        clients[userId] = clientWrapper; // Store the client once it's fully ready
         delete initialisingClients[userId];
         resolve(clientWrapper);
       });
 
+      client.on('remote_session_saved', () => {
+        console.log(`[DEBUG] Remote session for user ${userId} saved to DB.`);
+      });
+
       client.on("auth_failure", (msg) => {
-        console.error("Authentication failure", msg);
-        delete clients[userId];
-        delete initialisingClients[userId];
+        console.error(`Authentication failure for user ${userId}:`, msg);
         reject(new Error("Authentication failure"));
+      });
+
+      client.on('disconnected', async (reason) => {
+        console.log(`Client for user ${userId} was logged out:`, reason);
+        try {
+          await store.delete({ clientId: userId });
+        } catch (err) {
+          console.error('Failed to delete session from DB on disconnect:', err);
+        }
+        delete clients[userId];
       });
 
       client.on("message", async (msg) => {
