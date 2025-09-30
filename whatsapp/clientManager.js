@@ -5,130 +5,204 @@ const path = require("path");
 const FormData = require("form-data");
 const fetch = require("node-fetch");
 const Message = require("../models/Message");
-const { text } = require("stream/consumers");
+const WhatsappSession = require("../models/WhatsappSession");
 
 const clients = {};
+const initialisingClients = {};
 
-// Helper function: send file to your Flask API (/analyze)
+async function getSession(userId) {
+  const record = await WhatsappSession.findOne({ userId });
+  return record?.sessionData || null;
+}
+
+async function saveSession(userId, session) {
+  await WhatsappSession.findOneAndUpdate(
+    { userId },
+    { sessionData: session, updatedAt: new Date() },
+    { upsert: true }
+  );
+}
+
 async function analyzeWithKMRLApi(filePath) {
   const form = new FormData();
   form.append("file", fs.createReadStream(filePath));
 
-  try {
-    const response = await fetch("https://kmrl-document-analysis-1.onrender.com/analyze", {
+  const response = await fetch(
+    "https://kmrl-document-analysis-1.onrender.com/analyze",
+    {
       method: "POST",
       body: form,
-      headers: form.getHeaders(), // Important for multipart/form-data
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`KMRL API error: ${text}`);
+      headers: form.getHeaders(),
     }
+  );
 
-    const result = await response.json();
-    return result;
-  } catch (err) {
-    throw new Error(`Predict error: ${err.message}`);
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`KMRL API error: ${text}`);
   }
+
+  return response.json();
 }
 
-function createClient(userId) {
+async function createClient(userId) {
+  // If a client already exists, return it
   if (clients[userId]) return clients[userId];
 
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: userId }),
-  });
+  // If a client is currently being initialized, return the ongoing promise
+  if (initialisingClients[userId]) return initialisingClients[userId];
 
-  client.on("qr", async (qr) => {
-    const qrCodeImage = await qrcode.toDataURL(qr);
-    clients[userId].qr = qrCodeImage;
-  });
-
-  client.on("ready", () => {
-    console.log(`✅ WhatsApp client ready for user ${userId}`);
-  });
-
-  client.on("message", async (msg) => {
+  const clientPromise = new Promise(async (resolve, reject) => {
     try {
-      // MEDIA MESSAGES
-      if (msg.hasMedia) {
-        const media = await msg.downloadMedia();
-        const extension = media.mimetype.split("/")[1] || "bin"; // fallback
-        const fileName = `${Date.now()}.${extension}`;
-        const userDir = path.join("uploads", userId.toString());
-        if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
+      const client = new Client({
+        authStrategy: new LocalAuth({ clientId: userId }),
+        puppeteer: {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu'
+        ],
+    }
+      });
 
-        const fullFilePath = path.join(userDir, fileName);
-        fs.writeFileSync(fullFilePath, media.data, "base64");
+      const clientWrapper = { client, qr: null };
 
-        const savedMsg = await Message.create({
-          userId,
-          from: msg.from,
-          type: "media",
-          fileName,
-          mimeType: media.mimetype,
-          path: fullFilePath,
-        });
+      client.on("qr", async (qr) => {
+        console.log("📌 Scan QR to authenticate!");
+        const qrCodeImage = await qrcode.toDataURL(qr);
+        clientWrapper.qr = qrCodeImage;
+        clients[userId] = clientWrapper;
+        delete initialisingClients[userId];
+        resolve(clientWrapper);
+      });
 
-        console.log(`📂 Media saved for ${userId}: ${fileName}`);
+      client.on("authenticated", async (session) => {
+    console.log("[DEBUG] Event: 'authenticated'. Attempting to save session to DB.");
+    try {
+        await saveSession(userId, session);
+        console.log("[DEBUG] Session saved to DB successfully!");
+    } catch (error) {
+        console.error("[DEBUG] CRITICAL ERROR: Failed to save session to DB.", error);
+    }
+    
+    if (clients[userId]) {
+        clients[userId].qr = null; 
+    }
+});
 
-        // Analyze document using KMRL API
-        if (["pdf", "txt", "png", "jpg", "jpeg"].includes(extension)) {
-          try {
-            const apiData = await analyzeWithKMRLApi(fullFilePath);
-            console.log("📊 KMRL API response:", apiData);
+      client.on("ready", () => {
+        console.log(`✅ WhatsApp client ready for user ${userId}`);
+        clientWrapper.qr = null;
+        clients[userId] = clientWrapper;
+        delete initialisingClients[userId];
+        resolve(clientWrapper);
+      });
 
-            savedMsg.analysis = {
-              isRelevant: apiData?.is_relevant ?? false,
-              summary: apiData?.summary || "",
-              raw: apiData,
-            };
+      client.on("auth_failure", (msg) => {
+        console.error("Authentication failure", msg);
+        delete clients[userId];
+        delete initialisingClients[userId];
+        reject(new Error("Authentication failure"));
+      });
 
-            try {
-              await savedMsg.save();
-            } catch (err) {
-              console.error("Failed to save message with analysis:", err.message);
+      client.on("message", async (msg) => {
+        try {
+          // MEDIA MESSAGES
+
+          if (msg.hasMedia) {
+            const media = await msg.downloadMedia();
+
+            const extension = media.mimetype.split("/")[1] || "bin";
+
+            const fileName = `${Date.now()}.${extension}`;
+
+            const userDir = path.join("uploads", userId.toString());
+
+            if (!fs.existsSync(userDir))
+              fs.mkdirSync(userDir, { recursive: true });
+
+            const fullFilePath = path.join(userDir, fileName);
+
+            fs.writeFileSync(fullFilePath, media.data, "base64");
+
+            const savedMsg = await Message.create({
+              userId,
+
+              from: msg.from,
+
+              type: "media",
+
+              fileName,
+
+              mimeType: media.mimetype,
+
+              path: fullFilePath,
+            });
+
+            if (["pdf", "txt", "png", "jpg", "jpeg"].includes(extension)) {
+              try {
+                const apiData = await analyzeWithKMRLApi(fullFilePath);
+
+                savedMsg.analysis = {
+                  isRelevant: apiData?.is_relevant ?? false,
+
+                  summary: apiData?.summary || "",
+
+                  raw: apiData,
+                };
+
+                await savedMsg.save(); // Delete irrelevant media
+
+                if (!savedMsg.analysis.isRelevant) {
+                  if (fs.existsSync(savedMsg.path))
+                    fs.unlinkSync(savedMsg.path);
+
+                  await Message.findByIdAndDelete(savedMsg._id);
+
+                  console.log(`❌ Irrelevant media deleted: ${fileName}`);
+                }
+              } catch (err) {
+                console.error("KMRL API Analysis failed:", err.message);
+              }
             }
+          } // TEXT MESSAGES
+          else if (msg.body) {
+            const savedMsg = await Message.create({
+              userId,
 
-            console.log(`📝 File analyzed for ${userId}: ${fileName}`);
+              from: msg.from,
 
-             if (savedMsg.type === "text" || (savedMsg.type === "media" && savedMsg.analysis && !savedMsg.analysis.isRelevant))  {
-      // Delete file from disk
-      if (savedMsg.type === "media" && savedMsg.path && fs.existsSync(savedMsg.path)) {
-      fs.unlinkSync(savedMsg.path);
-    }
+              type: "text",
 
-      // Delete document from MongoDB
-      await Message.findByIdAndDelete(savedMsg._id);
+              body: msg.body,
+            });
 
-      console.log(`❌ Irrelevant media deleted: ${fileName}`);
-    }
-          } catch (err) {
-            console.error("KMRL API Analysis failed:", err.message);
+            console.log(`💬 Text saved: ${msg.body}`); // Auto-delete all text messages
+
+            await Message.findByIdAndDelete(savedMsg._id);
+
+            console.log(`❌ Text message deleted: ${msg.body}`);
           }
+        } catch (err) {
+          console.error("Message handling error:", err.message);
         }
-      } 
-      // TEXT MESSAGES
-      else if (msg.body) {
-        const savedMsg = await Message.create({
-    userId,
-    from: msg.from,
-    type: "text",
-    body: msg.body,
-  });
-        console.log(`💬 Text saved for ${userId}: ${msg.body}`);
-        await Message.findByIdAndDelete(savedMsg._id);
-  console.log(`❌ Text message deleted: ${msg.body}`);
-      }
+      });
+
+      await client.initialize();
     } catch (err) {
-      console.error("Message handling error:", err.message);
+      console.error("Failed to create client:", err);
+      delete initialisingClients[userId];
+      reject(err);
     }
   });
 
-  client.initialize();
-  clients[userId] = { client, qr: null };
-  return clients[userId];
+  initialisingClients[userId] = clientPromise;
+  return clientPromise;
 }
 
 function getClient(userId) {
