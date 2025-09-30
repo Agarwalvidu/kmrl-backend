@@ -72,7 +72,11 @@ async function createClient(userId) {
   const clientPromise = new Promise(async (resolve, reject) => {
     try {
       const client = new Client({
-        authStrategy: new RemoteAuth({ clientId: userId }),
+        authStrategy: new RemoteAuth({
+    store: store,
+    clientId: userId,
+    backupSyncIntervalMs: 300000 // Correct value (5 minutes)
+}),
         puppeteer: {
         headless: true,
         args: [
